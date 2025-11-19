@@ -17,7 +17,8 @@ COPY frontend/ ./
 RUN npm run build
 
 # Stage 2: 后端构建
-FROM rust:1.75-slim AS backend-builder
+FROM rust:1.84-slim AS backend-builder
+FROM rust:1.84-slim AS backend-builder
 
 WORKDIR /app
 
