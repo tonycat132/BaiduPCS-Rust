@@ -378,7 +378,6 @@ cargo test
 
 - [qjfoidnh/BaiduPCS-Go](https://github.com/qjfoidnh/BaiduPCS-Go) - 本项目的重要参考
 - [GangZhuo/BaiduPCS](https://github.com/GangZhuo/BaiduPCS) - 原始项目灵感来源
-- [iikira/BaiduPCS-Go](https://github.com/iikira/BaiduPCS-Go) - 原版 BaiduPCS-Go
 - [Rust 社区](https://www.rust-lang.org/)
 - [Vue.js 社区](https://vuejs.org/)
 - [Element Plus](https://element-plus.org/)
