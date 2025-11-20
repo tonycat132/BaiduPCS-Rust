@@ -90,21 +90,25 @@ jobs:
           cargo install cross --git https://github.com/cross-rs/cross --locked
           cross --version
 
-      - name: Verify Cargo project (for cross)
-        if: matrix.use_cross == true
-        shell: bash
-        run: |
-          cd backend
-          cargo metadata --format-version 1 > /dev/null
-          echo "Cargo project metadata verified successfully"
-
       - name: Build backend
         shell: bash
+        env:
+          CROSS_NO_WARNINGS: "0"
         run: |
           set -e
           if [ "${{ matrix.use_cross }}" = "true" ]; then
-            # Build with cross from project root using manifest-path
-            cross build --release --target ${{ matrix.target }} --manifest-path backend/Cargo.toml
+            # Build with cross - must run from backend directory
+            cd backend
+            # Verify project first
+            echo "Verifying Cargo project..."
+            cargo metadata --format-version 1 > /dev/null || (echo "Failed to get Cargo metadata" && exit 1)
+            echo "Cargo metadata verified successfully"
+            # Show current directory and files
+            pwd
+            ls -la Cargo.toml || echo "Cargo.toml not found in current directory"
+            # Build with cross
+            echo "Starting cross build..."
+            cross build --release --target ${{ matrix.target }}
           else
             cd backend
             cargo build --release --target ${{ matrix.target }}
