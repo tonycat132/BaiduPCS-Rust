@@ -88,6 +88,12 @@ jobs:
             cargo build --release --target ${{ matrix.target }}
           fi
 
+      - name: Set up Python (for zip packaging)
+        if: matrix.archive == 'zip'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
       - name: Prepare package
         shell: bash
         run: |
@@ -110,18 +116,12 @@ jobs:
 
           if [ "${{ matrix.archive }}" = "zip" ]; then
             ARCHIVE_PATH="release/${ARTIFACT_NAME}.zip"
-            python3 - << 'EOF'
-import os
-import shutil
-
-artifact = os.environ["ARTIFACT_NAME"]
-shutil.make_archive(
-    os.path.join("release", artifact),
-    "zip",
-    "release",
-    artifact
-)
-EOF
+            # Try python3 first, fallback to python
+            if command -v python3 &> /dev/null; then
+              python3 -c "import os, shutil; artifact = os.environ['ARTIFACT_NAME']; shutil.make_archive(os.path.join('release', artifact), 'zip', 'release', artifact)"
+            else
+              python -c "import os, shutil; artifact = os.environ['ARTIFACT_NAME']; shutil.make_archive(os.path.join('release', artifact), 'zip', 'release', artifact)"
+            fi
           else
             ARCHIVE_PATH="release/${ARTIFACT_NAME}.tar.gz"
             tar czf "$ARCHIVE_PATH" -C release "$ARTIFACT_NAME"
