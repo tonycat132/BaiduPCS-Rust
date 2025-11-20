@@ -96,28 +96,37 @@ jobs:
           export ARTIFACT_NAME
           PKG_DIR=release/$ARTIFACT_NAME
           mkdir -p "$PKG_DIR"
+
           BIN_PATH="backend/target/${{ matrix.target }}/release/${{ matrix.binary }}"
           cp "$BIN_PATH" "$PKG_DIR/"
           chmod +x "$PKG_DIR/${{ matrix.binary }}" || true
+
           cp -R frontend/dist "$PKG_DIR/frontend"
           mkdir -p "$PKG_DIR/config"
           cp config/app.toml.example "$PKG_DIR/config/app.toml.example"
           cp README.md "$PKG_DIR/README.md"
+
           echo "ARTIFACT_NAME=$ARTIFACT_NAME" >> $GITHUB_ENV
+
           if [ "${{ matrix.archive }}" = "zip" ]; then
             ARCHIVE_PATH="release/${ARTIFACT_NAME}.zip"
-            python - <<'PY'
-              import os
-              import shutil
+            python3 - << 'EOF'
+import os
+import shutil
 
-              artifact = os.environ["ARTIFACT_NAME"]
-              base_dir = os.path.join("release", artifact)
-              shutil.make_archive(os.path.join("release", artifact), "zip", "release", artifact)
-PY
+artifact = os.environ["ARTIFACT_NAME"]
+shutil.make_archive(
+    os.path.join("release", artifact),
+    "zip",
+    "release",
+    artifact
+)
+EOF
           else
             ARCHIVE_PATH="release/${ARTIFACT_NAME}.tar.gz"
             tar czf "$ARCHIVE_PATH" -C release "$ARTIFACT_NAME"
           fi
+
           echo "ARCHIVE_PATH=$ARCHIVE_PATH" >> $GITHUB_ENV
 
       - name: Upload to GitHub Release
@@ -126,4 +135,3 @@ PY
           files: ${{ env.ARCHIVE_PATH }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
