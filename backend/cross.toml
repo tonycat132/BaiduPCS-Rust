@@ -5,3 +5,8 @@
 # 使用官方 Docker 镜像进行交叉编译
 image = "ghcr.io/cross-rs/aarch64-unknown-linux-gnu:main"
 
+# 配置构建选项
+[build]
+# 禁用警告，避免元数据获取警告导致构建失败
+xargo = false
+
