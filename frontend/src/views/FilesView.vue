@@ -159,14 +159,11 @@
 <script setup lang="ts">
 import {ref, onMounted, computed} from 'vue'
 import {ElMessage} from 'element-plus'
-import {useRouter} from 'vue-router'
 import {getFileList, formatFileSize, formatTime, createFolder, type FileItem} from '@/api/file'
 import {createDownload, createFolderDownload} from '@/api/download'
 import {createUpload, createFolderUpload} from '@/api/upload'
 import {FilePickerModal} from '@/components/FilePicker'
 import type {FileEntry} from '@/api/filesystem'
-
-const router = useRouter()
 
 // 状态
 const loading = ref(false)
