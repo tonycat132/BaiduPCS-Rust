@@ -117,6 +117,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/downloads", post(handlers::create_download))
         .route("/downloads", get(handlers::get_all_downloads))
         .route("/downloads/all", get(handlers::get_all_downloads_mixed))  // 新增：统一接口
+        .route("/downloads/batch", post(handlers::create_batch_download))  // 批量下载
         .route("/downloads/:id", get(handlers::get_download))
         .route("/downloads/:id/pause", post(handlers::pause_download))
         .route("/downloads/:id/resume", post(handlers::resume_download))
@@ -154,6 +155,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/config", put(handlers::update_config))
         .route("/config/recommended", get(handlers::get_recommended_config))
         .route("/config/reset", post(handlers::reset_to_recommended))
+        .route("/config/recent-dir", post(handlers::update_recent_dir))
+        .route("/config/default-download-dir", post(handlers::set_default_download_dir))
         .with_state(app_state.clone());
 
     // 自动检测前端资源目录

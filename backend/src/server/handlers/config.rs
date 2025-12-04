@@ -3,7 +3,8 @@
 use crate::config::{AppConfig, DownloadConfig, PathValidationResult, VipRecommendedConfig, VipType};
 use crate::server::error::{ApiError, ApiResult};
 use axum::{extract::State, response::Json};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 use tracing::{info, warn};
 
 use super::ApiResponse;
@@ -231,6 +232,123 @@ pub async fn update_config(
     };
 
     Ok(Json(ApiResponse::success(response)))
+}
+
+/// 更新最近目录请求
+#[derive(Debug, Deserialize)]
+pub struct UpdateRecentDirRequest {
+    /// 目录类型: "download" 或 "upload"
+    pub dir_type: String,
+    /// 最近使用的目录路径
+    pub path: String,
+}
+
+/// POST /api/v1/config/recent-dir
+/// 更新最近使用的目录（下载/上传）
+pub async fn update_recent_dir(
+    State(app_state): State<crate::server::AppState>,
+    Json(req): Json<UpdateRecentDirRequest>,
+) -> ApiResult<Json<ApiResponse<String>>> {
+    info!("更新最近目录: type={}, path={}", req.dir_type, req.path);
+
+    // 验证路径
+    let path = PathBuf::from(&req.path);
+    if !path.is_absolute() {
+        return Err(ApiError::BadRequest("路径必须是绝对路径".to_string()));
+    }
+
+    // 获取当前配置
+    let mut config = app_state.config.read().await.clone();
+
+    // 根据类型更新对应的最近目录
+    match req.dir_type.as_str() {
+        "download" => {
+            config.download.recent_directory = Some(path);
+            info!("已更新下载最近目录: {:?}", config.download.recent_directory);
+        }
+        "upload" => {
+            config.upload.recent_directory = Some(path);
+            info!("已更新上传最近目录: {:?}", config.upload.recent_directory);
+        }
+        _ => {
+            return Err(ApiError::BadRequest(format!(
+                "无效的目录类型: {}，必须是 'download' 或 'upload'",
+                req.dir_type
+            )));
+        }
+    }
+
+    // 保存到文件
+    config
+        .save_to_file("config/app.toml")
+        .await
+        .map_err(ApiError::Internal)?;
+
+    // 更新内存中的配置
+    *app_state.config.write().await = config;
+
+    Ok(Json(ApiResponse::success("最近目录已更新".to_string())))
+}
+
+/// 设置默认下载目录请求
+#[derive(Debug, Deserialize)]
+pub struct SetDefaultDirRequest {
+    /// 默认下载目录路径
+    pub path: String,
+}
+
+/// POST /api/v1/config/default-download-dir
+/// 设置默认下载目录
+pub async fn set_default_download_dir(
+    State(app_state): State<crate::server::AppState>,
+    Json(req): Json<SetDefaultDirRequest>,
+) -> ApiResult<Json<ApiResponse<String>>> {
+    info!("设置默认下载目录: {}", req.path);
+
+    // 验证路径
+    let path = PathBuf::from(&req.path);
+    if !path.is_absolute() {
+        return Err(ApiError::BadRequest("路径必须是绝对路径".to_string()));
+    }
+
+    // 验证路径存在
+    if !path.exists() {
+        return Err(ApiError::BadRequest(format!(
+            "目录不存在: {}",
+            req.path
+        )));
+    }
+
+    // 获取当前配置
+    let mut config = app_state.config.read().await.clone();
+    config.download.default_directory = Some(path.clone());
+
+    // 同时更新 download_dir（主下载目录）
+    config.download.download_dir = path;
+
+    // 保存到文件
+    config
+        .save_to_file("config/app.toml")
+        .await
+        .map_err(ApiError::Internal)?;
+
+    // 更新内存中的配置
+    *app_state.config.write().await = config.clone();
+
+    // 同步更新下载管理器的下载目录
+    let manager_guard = app_state.download_manager.read().await;
+    if let Some(manager) = manager_guard.as_ref() {
+        manager.update_download_dir(config.download.download_dir.clone()).await;
+        info!("✓ 下载管理器下载目录已更新");
+    }
+    drop(manager_guard);
+
+    // 同步更新文件夹下载管理器的下载目录
+    app_state.folder_download_manager
+        .update_download_dir(config.download.download_dir.clone())
+        .await;
+
+    Ok(Json(ApiResponse::success("默认下载目录已设置".to_string())))
 }
 
 #[cfg(test)]

@@ -44,6 +44,15 @@ pub struct ServerConfig {
 pub struct DownloadConfig {
     /// 默认下载目录
     pub download_dir: PathBuf,
+    /// 用户设置的默认目录（用于"设置为默认"功能）
+    #[serde(default)]
+    pub default_directory: Option<PathBuf>,
+    /// 最近使用的下载目录
+    #[serde(default)]
+    pub recent_directory: Option<PathBuf>,
+    /// 每次下载时是否询问保存位置
+    #[serde(default = "default_ask_each_time")]
+    pub ask_each_time: bool,
     /// 全局最大线程数（所有下载任务共享）
     pub max_global_threads: usize,
     /// 分片大小 (MB)
@@ -52,6 +61,11 @@ pub struct DownloadConfig {
     pub max_concurrent_tasks: usize,
     /// 最大重试次数
     pub max_retries: u32,
+}
+
+/// 默认每次询问保存位置
+fn default_ask_each_time() -> bool {
+    true
 }
 
 /// 上传配置
@@ -67,6 +81,9 @@ pub struct UploadConfig {
     pub max_retries: u32,
     /// 上传文件夹时是否跳过隐藏文件（以.开头的文件/文件夹）
     pub skip_hidden_files: bool,
+    /// 最近使用的上传源目录
+    #[serde(default)]
+    pub recent_directory: Option<PathBuf>,
 }
 
 impl Default for UploadConfig {
@@ -77,6 +94,7 @@ impl Default for UploadConfig {
             max_concurrent_tasks: 5,
             max_retries: 3,
             skip_hidden_files: false,   // 默认不跳过隐藏文件
+            recent_directory: None,     // 默认无最近目录
         }
     }
 }
@@ -359,6 +377,9 @@ impl Default for AppConfig {
             },
             download: DownloadConfig {
                 download_dir,
+                default_directory: None,
+                recent_directory: None,
+                ask_each_time: true,
                 max_global_threads: svip_config.threads,
                 chunk_size_mb: svip_config.chunk_size,
                 max_concurrent_tasks: svip_config.max_tasks,
@@ -542,6 +563,9 @@ mod tests {
     fn test_config_validation() {
         let mut config = DownloadConfig {
             download_dir: std::env::current_dir().unwrap().join("downloads"),
+            default_directory: None,
+            recent_directory: None,
+            ask_each_time: true,
             max_global_threads: 5,
             chunk_size_mb: 10,
             max_concurrent_tasks: 2,
@@ -568,6 +592,9 @@ mod tests {
         let absolute_path = std::env::current_dir().unwrap().join("downloads");
         let absolute_config = DownloadConfig {
             download_dir: absolute_path,
+            default_directory: None,
+            recent_directory: None,
+            ask_each_time: true,
             max_global_threads: 5,
             chunk_size_mb: 10,
             max_concurrent_tasks: 2,
@@ -578,6 +605,9 @@ mod tests {
         // 测试相对路径验证（应该失败）
         let relative_config = DownloadConfig {
             download_dir: PathBuf::from("downloads"),
+            default_directory: None,
+            recent_directory: None,
+            ask_each_time: true,
             max_global_threads: 5,
             chunk_size_mb: 10,
             max_concurrent_tasks: 2,
@@ -590,6 +620,9 @@ mod tests {
         {
             let windows_config = DownloadConfig {
                 download_dir: PathBuf::from("D:\\Downloads"),
+                default_directory: None,
+                recent_directory: None,
+                ask_each_time: true,
                 max_global_threads: 5,
                 chunk_size_mb: 10,
                 max_concurrent_tasks: 2,
@@ -602,6 +635,9 @@ mod tests {
         {
             let unix_config = DownloadConfig {
                 download_dir: PathBuf::from("/app/downloads"),
+                default_directory: None,
+                recent_directory: None,
+                ask_each_time: true,
                 max_global_threads: 5,
                 chunk_size_mb: 10,
                 max_concurrent_tasks: 2,

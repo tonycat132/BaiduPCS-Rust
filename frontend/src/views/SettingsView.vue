@@ -134,6 +134,18 @@
                 </div>
               </el-form-item>
 
+              <el-form-item label="下载时选择目录" prop="download.ask_each_time">
+                <el-switch
+                    v-model="formData.download.ask_each_time"
+                    active-text="每次询问"
+                    inactive-text="使用默认"
+                />
+                <div class="form-tip">
+                  开启后，每次下载都会弹出文件资源管理器让您选择保存位置；
+                  关闭后将直接使用默认下载目录
+                </div>
+              </el-form-item>
+
               <el-form-item label="全局最大线程数" prop="download.max_global_threads">
                 <el-slider
                     v-model="formData.download.max_global_threads"
@@ -322,7 +334,7 @@
                 </div>
                 <div class="about-item">
                   <span class="label">版本:</span>
-                  <span class="value">v1.3.0</span>
+                  <span class="value">v1.4.0</span>
                 </div>
                 <div class="about-item">
                   <span class="label">后端技术:</span>

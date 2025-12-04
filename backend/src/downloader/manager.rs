@@ -85,10 +85,47 @@ impl DownloadManager {
         let local_path = download_dir.join(&filename);
         drop(download_dir);
 
+        self.create_task_internal(fs_id, remote_path, local_path, total_size).await
+    }
+
+    /// 创建下载任务（指定下载目录）
+    ///
+    /// 用于批量下载时支持自定义下载目录
+    pub async fn create_task_with_dir(
+        &self,
+        fs_id: u64,
+        remote_path: String,
+        filename: String,
+        total_size: u64,
+        target_dir: &std::path::Path,
+    ) -> Result<String> {
+        let local_path = target_dir.join(&filename);
+        self.create_task_internal(fs_id, remote_path, local_path, total_size).await
+    }
+
+    /// 内部方法：创建下载任务
+    async fn create_task_internal(
+        &self,
+        fs_id: u64,
+        remote_path: String,
+        local_path: PathBuf,
+        total_size: u64,
+    ) -> Result<String> {
+        // 确保目标目录存在
+        if let Some(parent) = local_path.parent() {
+            if !parent.exists() {
+                std::fs::create_dir_all(parent).context("创建下载目录失败")?;
+            }
+        }
+
         // 检查文件是否已存在
         if local_path.exists() {
             warn!("文件已存在: {:?}，将覆盖", local_path);
         }
+
+        let filename = local_path.file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "unknown".to_string());
 
         let task = DownloadTask::new(fs_id, remote_path, local_path, total_size);
         let task_id = task.id.clone();
@@ -790,6 +827,105 @@ impl DownloadManager {
         }
 
         result
+    }
+
+    /// 从等待队列中移除指定 group 的所有任务
+    ///
+    /// 用于文件夹暂停时，防止暂停活跃任务后触发从等待队列启动新任务
+    pub async fn remove_waiting_tasks_by_group(&self, group_id: &str) -> usize {
+        let mut waiting_queue = self.waiting_queue.write().await;
+        let tasks = self.tasks.read().await;
+
+        let original_len = waiting_queue.len();
+
+        // 保留不属于该 group 的任务
+        let mut new_queue = VecDeque::new();
+        for task_id in waiting_queue.drain(..) {
+            let should_keep = if let Some(task_arc) = tasks.get(&task_id) {
+                let task = task_arc.lock().await;
+                task.group_id.as_deref() != Some(group_id)
+            } else {
+                true // 任务不存在，保留 ID（后续会自然处理）
+            };
+
+            if should_keep {
+                new_queue.push_back(task_id);
+            }
+        }
+
+        let removed_count = original_len - new_queue.len();
+        *waiting_queue = new_queue;
+
+        if removed_count > 0 {
+            info!(
+                "从等待队列移除了 {} 个属于文件夹 {} 的任务",
+                removed_count, group_id
+            );
+        }
+
+        removed_count
+    }
+
+    /// 取消指定 group 的所有任务（包括正在探测中的任务）
+    ///
+    /// 用于文件夹暂停时，取消所有子任务：
+    /// - 从等待队列移除
+    /// - 触发取消令牌（让正在探测的任务知道应该停止）
+    /// - 从调度器取消（已注册的任务）
+    /// - 更新任务状态为 Paused
+    ///
+    /// 注意：此方法不会删除任务，只是暂停它们
+    pub async fn cancel_tasks_by_group(&self, group_id: &str) {
+        // 1. 从等待队列移除
+        self.remove_waiting_tasks_by_group(group_id).await;
+
+        // 2. 获取该 group 的所有任务 ID
+        let task_ids: Vec<String> = {
+            let tasks = self.tasks.read().await;
+            tasks
+                .iter()
+                .filter_map(|(id, task_arc)| {
+                    // 使用 try_lock 避免死锁
+                    if let Ok(task) = task_arc.try_lock() {
+                        if task.group_id.as_deref() == Some(group_id) {
+                            return Some(id.clone());
+                        }
+                    }
+                    None
+                })
+                .collect()
+        };
+
+        info!(
+            "取消文件夹 {} 的 {} 个任务（包括探测中的）",
+            group_id,
+            task_ids.len()
+        );
+
+        // 3. 对每个任务：触发取消令牌 + 从调度器取消 + 更新状态
+        for task_id in &task_ids {
+            // 触发取消令牌（让正在探测的任务知道应该停止）
+            {
+                let tokens = self.cancellation_tokens.read().await;
+                if let Some(token) = tokens.get(task_id) {
+                    token.cancel();
+                }
+            }
+
+            // 从调度器取消（已注册的任务）
+            self.chunk_scheduler.cancel_task(task_id).await;
+
+            // 更新任务状态为 Paused
+            {
+                let tasks = self.tasks.read().await;
+                if let Some(task_arc) = tasks.get(task_id) {
+                    let mut task = task_arc.lock().await;
+                    if task.status == TaskStatus::Downloading || task.status == TaskStatus::Pending {
+                        task.mark_paused();
+                    }
+                }
+            }
+        }
     }
 
     /// 添加任务（由 FolderDownloadManager 调用）
