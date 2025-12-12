@@ -259,15 +259,15 @@ import {ref, onMounted, computed} from 'vue'
 import {ElMessage} from 'element-plus'
 import {getFileList, formatFileSize, formatTime, createFolder, type FileItem} from '@/api/file'
 import {useIsMobile} from '@/utils/responsive'
-
-// 响应式检测
-const isMobile = useIsMobile()
 import {createDownload, createFolderDownload, createBatchDownload, type BatchDownloadItem} from '@/api/download'
 import {createUpload, createFolderUpload} from '@/api/upload'
 import {getConfig, updateRecentDirDebounced, setDefaultDownloadDir, type DownloadConfig, type UploadConfig} from '@/api/config'
 import {FilePickerModal} from '@/components/FilePicker'
 import TransferDialog from '@/components/TransferDialog.vue'
 import type {FileEntry} from '@/api/filesystem'
+
+// 响应式检测
+const isMobile = useIsMobile()
 
 // 下载配置状态
 const downloadConfig = ref<DownloadConfig | null>(null)

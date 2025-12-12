@@ -756,7 +756,7 @@ function onFolderDetailClose() {
   stopFolderDetailTimer()
 
   // 清理弹窗数据
-  folderDetailDialog.value.folderId = null
+  folderDetailDialog.value.folderId = ''
   folderDetailDialog.value.tasks = []
 
   // 🔥 主列表订阅保持不变（主列表一直需要订阅）
