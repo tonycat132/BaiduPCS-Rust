@@ -18,6 +18,8 @@ jobs:
             archive: tar
             binary: baidu-netdisk-rust
             use_cross: false
+            use_zigbuild: true
+            zig_glibc: "2.31"
           - platform: linux-arm64
             os: ubuntu-latest
             target: aarch64-unknown-linux-musl
