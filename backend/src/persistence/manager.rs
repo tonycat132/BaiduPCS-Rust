@@ -984,6 +984,25 @@ impl PersistenceManager {
         Ok(())
     }
 
+    /// 更新任务警告信息（不改变任务状态）
+    ///
+    /// 用于分批转存部分批次失败但整体成功的场景，
+    /// 在 error_msg 中记录警告信息，但不将任务标记为 Failed。
+    ///
+    /// # Arguments
+    /// * `task_id` - 任务 ID
+    /// * `warning` - 警告信息
+    pub fn update_transfer_warning(&self, task_id: &str, warning: String) -> std::io::Result<()> {
+        let warning_owned = warning.clone();
+        update_metadata(&self.wal_dir, task_id, move |m| {
+            m.set_error_msg(warning_owned);
+        })?;
+
+        debug!("已更新任务警告信息（不影响状态）: task_id={}, warning={}", task_id, warning);
+
+        Ok(())
+    }
+
     /// 更新任务错误信息并将状态标记为 Failed
     ///
     /// # Arguments
