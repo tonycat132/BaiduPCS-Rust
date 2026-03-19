@@ -90,6 +90,21 @@ pub struct TransferResult {
     pub transferred_fs_ids: Vec<u64>,
 }
 
+/// 分批转存组信息（用于本地下载目录规划）
+#[derive(Debug, Clone)]
+pub struct BatchGroupInfo {
+    /// 组 ID（如 "group_1"）
+    pub group_id: String,
+    /// 远端目录（temp_dir/group_N）
+    pub remote_dir: String,
+    /// 原始分享文件信息
+    pub files: Vec<SharedFileInfo>,
+    /// 转存后的远端路径
+    pub transferred_paths: Vec<String>,
+    /// 转存后的新 fs_id（用于下载）
+    pub transferred_fs_ids: Vec<u64>,
+}
+
 /// 分享链接状态
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ShareStatus {

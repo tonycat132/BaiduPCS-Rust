@@ -9,7 +9,7 @@ use crate::persistence::{
 use crate::server::events::{TaskEvent, TransferEvent};
 use crate::server::websocket::WebSocketManager;
 use crate::transfer::task::{TransferStatus, TransferTask};
-use crate::transfer::types::{CleanupResult, CleanupStatus, ShareLink, SharePageInfo, SharedFileInfo, TransferResult};
+use crate::transfer::types::{BatchGroupInfo, CleanupResult, CleanupStatus, ShareLink, SharePageInfo, SharedFileInfo, TransferResult};
 use anyhow::{Context, Result};
 use dashmap::DashMap;
 use std::path::PathBuf;
@@ -862,9 +862,9 @@ impl TransferManager {
             };
             let dup_count = fs_ids.len() - unique_count;
 
-            // 统计同名文件（basename 维度）
+            // 🔥 统计同名文件（basename 维度）- 基于 filtered_file_list（真实选择集）
             let mut name_counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
-            for f in &file_list {
+            for f in &filtered_file_list {
                 *name_counts.entry(f.name.as_str()).or_insert(0) += 1;
             }
             let mut dup_basenames: Vec<(&str, usize)> = name_counts
@@ -877,66 +877,214 @@ impl TransferManager {
             info!(
                 "转存请求摘要: internal_task_id={}, share_key={}, save_path={}, \
                  is_share_direct_download={}, selected_fs_ids_count={}, selected_files_count={}, \
-                 fs_ids_count={}, unique_fs_ids={}, dup_fs_ids={}, dup_basenames={:?}",
+                 filtered_file_list_count={}, fs_ids_count={}, unique_fs_ids={}, dup_fs_ids={}, dup_basenames={:?}",
                 task_id,
                 share_link.short_key,
                 save_path,
                 is_share_direct_download,
                 selected_fs_ids.as_ref().map_or(0, |v| v.len()),
                 t.selected_files.as_ref().map_or(0, |v| v.len()),
+                filtered_file_list.len(),
                 fs_ids.len(),
                 unique_count,
                 dup_count,
                 dup_basenames,
             );
+
+            // 🔥 诊断日志：真实选择集里的跨目录同名 basename 列表
+            let mut basename_to_paths: std::collections::HashMap<&str, Vec<&str>> = std::collections::HashMap::new();
+            for f in &filtered_file_list {
+                basename_to_paths.entry(f.name.as_str()).or_insert_with(Vec::new).push(f.path.as_str());
+            }
+            let cross_dir_duplicates: Vec<(&str, Vec<&str>)> = basename_to_paths
+                .into_iter()
+                .filter(|(_, paths)| {
+                    if paths.len() <= 1 {
+                        return false;
+                    }
+                    // 检查是否跨目录：提取父目录并去重
+                    let parent_dirs: std::collections::HashSet<_> = paths
+                        .iter()
+                        .filter_map(|p| p.rsplit_once('/').map(|(parent, _)| parent))
+                        .collect();
+                    parent_dirs.len() > 1
+                })
+                .collect();
+
+            if !cross_dir_duplicates.is_empty() {
+                warn!(
+                    "🔍 诊断：真实选择集里的跨目录同名文件 (task_id={}, count={})",
+                    task_id,
+                    cross_dir_duplicates.len()
+                );
+                for (basename, paths) in cross_dir_duplicates.iter().take(10) {
+                    warn!("  - basename='{}', paths={:?}", basename, paths);
+                }
+            } else {
+                info!("🔍 诊断：真实选择集无跨目录同名文件 (task_id={})", task_id);
+            }
         }
-        let transfer_result = client
-            .transfer_share_files(
-                &share_info.shareid,
-                &share_info.share_uk,
-                &share_info.bdstoken,
-                &fs_ids,
-                &save_path,
-                &referer,
-                Some(task_id),
-            )
-            .await;
 
-        // 如果转存失败且错误是"路径不存在"(errno=2)，尝试创建目录后重试一次
-        let transfer_result = match &transfer_result {
-            Ok(result) if !result.success => {
-                let err_msg = result.error.as_deref().unwrap_or("");
-                if err_msg.contains("errno\":2") || err_msg.contains("路径不存在") {
-                    warn!("转存路径不存在，尝试创建目录后重试: {}", save_path);
+        // ========== 跨目录同名文件检测（仅分享直下场景） ==========
+        // 普通转存不做分批，避免在用户指定目录下生成 group_N 子目录
+        let cross_dir_dups = if is_share_direct_download {
+            detect_cross_dir_duplicates(&filtered_file_list)
+        } else {
+            Vec::new()
+        };
 
-                    // 创建父目录
-                    let parent_path = save_path.trim_end_matches('/');
-                    if let Some(parent) = parent_path.rsplit_once('/').map(|(p, _)| p) {
-                        if !parent.is_empty() {
-                            let _ = client.create_folder(parent).await;
+        let (transfer_result, batch_groups_info): (Result<TransferResult>, Option<Vec<BatchGroupInfo>>) =
+            if cross_dir_dups.is_empty() {
+                // === 快速路径：无跨目录同名文件，单次转存 ===
+                let transfer_result = client
+                    .transfer_share_files(
+                        &share_info.shareid,
+                        &share_info.share_uk,
+                        &share_info.bdstoken,
+                        &fs_ids,
+                        &save_path,
+                        &referer,
+                        Some(task_id),
+                    )
+                    .await;
+
+                // 如果转存失败且错误是"路径不存在"(errno=2)，尝试创建目录后重试一次
+                let transfer_result = match &transfer_result {
+                    Ok(result) if !result.success => {
+                        let err_msg = result.error.as_deref().unwrap_or("");
+                        if err_msg.contains("errno\":2") || err_msg.contains("路径不存在") {
+                            warn!("转存路径不存在，尝试创建目录后重试: {}", save_path);
+
+                            let parent_path = save_path.trim_end_matches('/');
+                            if let Some(parent) = parent_path.rsplit_once('/').map(|(p, _)| p) {
+                                if !parent.is_empty() {
+                                    let _ = client.create_folder(parent).await;
+                                }
+                            }
+                            let _ = client.create_folder(&save_path).await;
+
+                            info!("重试转存: {} 个文件 -> {}", fs_ids.len(), save_path);
+                            client
+                                .transfer_share_files(
+                                    &share_info.shareid,
+                                    &share_info.share_uk,
+                                    &share_info.bdstoken,
+                                    &fs_ids,
+                                    &save_path,
+                                    &referer,
+                                    Some(task_id),
+                                )
+                                .await
+                        } else {
+                            transfer_result
                         }
                     }
-                    // 创建目标目录
-                    let _ = client.create_folder(&save_path).await;
+                    _ => transfer_result,
+                };
 
-                    info!("重试转存: {} 个文件 -> {}", fs_ids.len(), save_path);
-                    client
+                (transfer_result, None)
+            } else {
+                // === 慢速路径：存在跨目录同名文件，分批转存 ===
+                warn!(
+                    "检测到 {} 个跨目录同名 basename，启用分批转存: {:?}",
+                    cross_dir_dups.len(),
+                    cross_dir_dups.iter().take(10).collect::<Vec<_>>()
+                );
+
+                let groups = group_files_by_conflict(&filtered_file_list);
+                let total_groups = groups.len();
+                info!(
+                    "分组结果: {} 个安全组, 每组文件数: {:?}",
+                    total_groups,
+                    groups.iter().map(|(id, f)| format!("{}={}", id, f.len())).collect::<Vec<_>>()
+                );
+
+                let mut all_results: Vec<(usize, String, Vec<SharedFileInfo>, Result<TransferResult>)> = Vec::new();
+
+                for (batch_idx, (group_id, group_files)) in groups.into_iter().enumerate() {
+                    let batch_num = batch_idx + 1;
+
+                    // 检查取消
+                    if cancellation_token.is_cancelled() {
+                        warn!("分批转存被取消: batch {}/{}", batch_num, total_groups);
+                        break;
+                    }
+
+                    let group_target_dir = format!("{}/group_{}", save_path, batch_num);
+
+                    info!(
+                        "转存批次 {}/{}: {} 个文件 -> {}",
+                        batch_num, total_groups, group_files.len(), group_target_dir
+                    );
+
+                    // 创建组专属目标目录
+                    if let Err(e) = client.create_folder(&group_target_dir).await {
+                        let err_msg = e.to_string();
+                        if !err_msg.contains("errno=-8") {
+                            warn!("创建组目录失败: {}, error={}", group_target_dir, err_msg);
+                        }
+                    }
+
+                    // 提取该组的 fs_ids
+                    let group_fs_ids: Vec<u64> = group_files.iter().map(|f| f.fs_id).collect();
+
+                    // 转存该组
+                    let result = client
                         .transfer_share_files(
                             &share_info.shareid,
                             &share_info.share_uk,
                             &share_info.bdstoken,
-                            &fs_ids,
-                            &save_path,
+                            &group_fs_ids,
+                            &group_target_dir,
                             &referer,
                             Some(task_id),
                         )
-                        .await
-                } else {
-                    transfer_result
+                        .await;
+
+                    let batch_ok = match &result {
+                        Ok(r) => r.success,
+                        Err(_) => false,
+                    };
+                    info!(
+                        "批次 {}/{} 结果: success={}",
+                        batch_num, total_groups, batch_ok
+                    );
+
+                    all_results.push((batch_num, group_id, group_files, result));
+
+                    // 批次之间添加防抖延时
+                    if batch_num < total_groups {
+                        tokio::time::sleep(Duration::from_millis(800)).await;
+                    }
                 }
-            }
-            _ => transfer_result,
-        };
+
+                // 取消检查：如果是因为取消而 break，不走 merge 成功分支
+                if cancellation_token.is_cancelled() {
+                    warn!("分批转存已取消，跳过结果合并");
+                    (Err(anyhow::anyhow!("分批转存被用户取消")), None)
+                } else {
+                    let (merged, groups_info) = merge_batch_results(all_results, &save_path);
+
+                    // 如果有部分失败警告，保存到内存状态并持久化
+                    if merged.success {
+                        if let Some(ref warning) = merged.error {
+                            {
+                                let mut t = task.write().await;
+                                t.error = Some(warning.clone());
+                            }
+                            // 持久化警告信息（不改变任务状态），确保重启后可见
+                            if let Some(ref pm_arc) = persistence_manager {
+                                let pm = pm_arc.lock().await;
+                                if let Err(e) = pm.update_transfer_warning(task_id, warning.clone()) {
+                                    warn!("持久化分批转存警告失败: {}", e);
+                                }
+                            }
+                        }
+                    }
+
+                    (Ok(merged), Some(groups_info))
+                }
+            };
 
         match transfer_result {
             Ok(result) => {
@@ -1073,6 +1221,7 @@ impl TransferManager {
                         save_path,
                         cancellation_token,
                         is_share_direct_download,
+                        batch_groups_info,
                     )
                         .await?;
 
@@ -1238,6 +1387,7 @@ impl TransferManager {
                                 save_path,
                                 cancellation_token,
                                 is_share_direct_download,
+                                None,
                             )
                                 .await?;
 
@@ -1398,6 +1548,7 @@ impl TransferManager {
         _save_path: String,
         cancellation_token: CancellationToken,
         is_share_direct_download: bool,
+        batch_groups_info: Option<Vec<BatchGroupInfo>>,
     ) -> Result<()> {
         let dm_lock = download_manager.read().await;
         let dm = dm_lock.as_ref().context("下载管理器未设置")?;
@@ -1449,8 +1600,23 @@ impl TransferManager {
         }
 
         // 分类收集需要下载的文件和文件夹
-        let mut download_files: Vec<(u64, String, String, u64)> = Vec::new(); // (fs_id, remote_path, filename, size)
-        let mut download_folders: Vec<String> = Vec::new(); // 文件夹路径
+        // 元组：(fs_id, remote_path, filename, size, local_dir)
+        let mut download_files: Vec<(u64, String, String, u64, PathBuf)> = Vec::new();
+        let mut download_folders: Vec<(String, PathBuf)> = Vec::new(); // (remote_path, local_dir)
+
+        // 构建 remote_path → group_id 映射（分批转存时用于确定本地子目录）
+        let path_to_group: HashMap<String, String> = if let Some(ref groups) = batch_groups_info {
+            let mut map = HashMap::new();
+            for group in groups {
+                for path in &group.transferred_paths {
+                    map.insert(path.clone(), group.group_id.clone());
+                }
+            }
+            map
+        } else {
+            HashMap::new()
+        };
+        let is_batch = batch_groups_info.is_some();
 
         // 🔥 构建两级查找映射：
         //   1. path → SharedFileInfo：用原始分享路径精确匹配（无歧义，优先使用）
@@ -1473,6 +1639,19 @@ impl TransferManager {
                 .map(|p| p.rsplit('/').next().unwrap_or(p).to_string());
             let to_filename = transferred_path.rsplit('/').next().unwrap_or(transferred_path);
 
+            // 确定该文件的本地下载目录
+            let local_dir = if is_batch {
+                if let Some(group_id) = path_to_group.get(transferred_path.as_str()) {
+                    download_dir.join(group_id)
+                } else {
+                    // 未找到组映射（不应发生），回退到默认目录
+                    warn!("分批转存文件未找到组映射: path={}", transferred_path);
+                    download_dir.clone()
+                }
+            } else {
+                download_dir.clone()
+            };
+
             // 匹配优先级：
             // 1. from_path 全路径精确匹配（最可靠，可区分同名文件）
             // 2. from_filename + is_dir 匹配（防止文件/文件夹错配）
@@ -1493,8 +1672,8 @@ impl TransferManager {
                 info!("匹配文件信息: idx={}, name={}, is_dir={}, transferred_fs_id={:?}",
                     idx, file_info.name, file_info.is_dir, transferred_fs_id);
                 if file_info.is_dir {
-                    // 文件夹：记录路径，稍后调用文件夹下载
-                    download_folders.push(transferred_path.clone());
+                    // 文件夹：记录路径和本地目录
+                    download_folders.push((transferred_path.clone(), local_dir));
                     info!("发现文件夹: {}", transferred_path);
                 } else {
                     // 文件：记录下载信息，使用转存后的新 fs_id
@@ -1503,34 +1682,41 @@ impl TransferManager {
                         transferred_path.clone(),
                         file_info.name.clone(),
                         file_info.size,
+                        local_dir,
                     ));
                 }
             } else {
                 // 无法匹配到文件信息（可能是同名碰撞或分页未拉全）
                 warn!("无法匹配文件信息: idx={}, path={}, from={:?}, to_filename={}",
                     idx, transferred_path, from_filename, to_filename);
-                // 默认当作文件处理，使用转存后的文件名
                 let fs_id = transferred_fs_id.unwrap_or(0);
-                download_files.push((fs_id, transferred_path.clone(), to_filename.to_string(), 0));
+                download_files.push((fs_id, transferred_path.clone(), to_filename.to_string(), 0, local_dir));
             }
         }
 
         info!(
-            "分类完成: {} 个文件, {} 个文件夹",
+            "分类完成: {} 个文件, {} 个文件夹, is_batch={}",
             download_files.len(),
-            download_folders.len()
+            download_folders.len(),
+            is_batch
         );
 
         // 创建文件下载任务
         let mut download_task_ids = Vec::new();
-        for (fs_id, remote_path, filename, size) in download_files {
+        for (fs_id, remote_path, filename, size, local_dir) in download_files {
+            // 确保本地下载目录存在（分批模式下可能是 download_dir/group_N/）
+            if !local_dir.exists() {
+                if let Err(e) = tokio::fs::create_dir_all(&local_dir).await {
+                    warn!("创建本地下载目录失败: {:?}, error={}", local_dir, e);
+                }
+            }
             match dm
                 .create_task_with_dir(
                     fs_id,
                     remote_path.clone(),
                     filename.clone(),
                     size,
-                    &download_dir,
+                    &local_dir,
                     None,
                 )
                 .await
@@ -1574,9 +1760,15 @@ impl TransferManager {
         if !download_folders.is_empty() {
             let fdm_lock = folder_download_manager.read().await;
             if let Some(ref fdm) = *fdm_lock {
-                for folder_path in download_folders {
+                for (folder_path, local_dir) in download_folders {
+                    // 确保本地目录存在
+                    if !local_dir.exists() {
+                        if let Err(e) = tokio::fs::create_dir_all(&local_dir).await {
+                            warn!("创建本地文件夹下载目录失败: {:?}, error={}", local_dir, e);
+                        }
+                    }
                     match fdm
-                        .create_folder_download_with_dir(folder_path.clone(), &download_dir, None, None)
+                        .create_folder_download_with_dir(folder_path.clone(), &local_dir, None, None)
                         .await
                     {
                         Ok(folder_id) => {
@@ -2367,11 +2559,90 @@ impl TransferManager {
             }
         }
 
-        info!("临时目录共有 {} 个文件/文件夹", existing_files.len());
+        info!("临时目录根级共有 {} 个文件/文件夹", existing_files.len());
 
-        // ========== Phase 1: 根级 (name, is_dir) 匹配 ==========
-        // 构建 (文件名, is_dir) → (fs_id, path) 映射
-        // 文件和文件夹都记录完整远端路径，消费端不再猜测路径
+        // ========== 扫描 group_* 子目录（分批转存支持） ==========
+        let group_dirs: Vec<String> = existing_files
+            .iter()
+            .filter(|f| f.isdir == 1 && f.server_filename.starts_with("group_"))
+            .map(|f| f.path.clone())
+            .collect();
+
+        if !group_dirs.is_empty() {
+            info!(
+                "检测到 {} 个 group_* 子目录，扫描子目录内容",
+                group_dirs.len()
+            );
+            for group_dir in &group_dirs {
+                let mut gpage = 1u32;
+                loop {
+                    match client.get_file_list(group_dir, gpage, page_size).await {
+                        Ok(list) => {
+                            let batch_len = list.list.len();
+                            debug!(
+                                "扫描组子目录 {} 第 {} 页: {} 个项目",
+                                group_dir, gpage, batch_len
+                            );
+                            existing_files.extend(list.list);
+                            if (batch_len as u32) < page_size {
+                                break;
+                            }
+                            gpage += 1;
+                        }
+                        Err(e) => {
+                            warn!("扫描组子目录失败: dir={}, error={}", group_dir, e);
+                            break;
+                        }
+                    }
+                }
+            }
+            info!(
+                "含组子目录后共有 {} 个文件/文件夹",
+                existing_files.len()
+            );
+        }
+
+        // ========== 预计算 share_root（Phase 1/2 共用） ==========
+        // 推导 files_to_check 的公共父目录（即分享浏览目录）
+        // 按路径段（/分隔）逐段比较，避免 /share/A 错匹配 /share/AB
+        // 注意：所有文件的父目录都参与计算（包括根级文件的空父路径）
+        let share_root = {
+            let parents: Vec<Vec<&str>> = files_to_check
+                .iter()
+                .map(|f| {
+                    let parent = f.path.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
+                    parent.split('/').collect::<Vec<_>>()
+                })
+                .collect();
+            if parents.is_empty() {
+                String::new()
+            } else {
+                let mut common_segments = parents[0].clone();
+                for segs in &parents[1..] {
+                    let match_len = common_segments
+                        .iter()
+                        .zip(segs.iter())
+                        .take_while(|(a, b)| a == b)
+                        .count();
+                    common_segments.truncate(match_len);
+                }
+                common_segments.join("/")
+            }
+        };
+        debug!("推导的分享根目录: {:?}", share_root);
+
+        let temp_base = temp_dir.trim_end_matches('/');
+
+        // ========== Phase 1: 路径优先 + 名称回退匹配 ==========
+        // 构建 full_path → (fs_id, path) 映射（所有层级，含 group_* 子目录）
+        let mut path_to_item: HashMap<&str, (Option<u64>, &str)> = HashMap::new();
+        for file in &existing_files {
+            let is_dir = file.isdir == 1;
+            let fs_id = if is_dir { None } else { Some(file.fs_id) };
+            path_to_item.insert(file.path.as_str(), (fs_id, file.path.as_str()));
+        }
+
+        // 构建 (文件名, is_dir) → (fs_id, path) 映射（仅根级，用于名称回退）
         let mut name_dir_to_item: HashMap<(String, bool), (Option<u64>, String)> = HashMap::new();
         for file in &existing_files {
             let is_dir = file.isdir == 1;
@@ -2382,18 +2653,72 @@ impl TransferManager {
             );
         }
 
-        // consumed 集合防止同名项双重匹配同一个根级条目
-        let mut consumed: std::collections::HashSet<(String, bool)> = std::collections::HashSet::new();
+        // consumed_paths 防止同一个远端文件被多次匹配
+        let mut consumed_paths: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut recovered_items = Vec::new();
-        let mut unmatched_files: Vec<&SharedFileInfo> = Vec::new();
+
+        // ---------- Pass 1: 严格路径匹配（不做名称回退） ----------
+        // 先把所有能精确命中 expected_path 的文件锁定，避免名称回退抢占路径归属
+        let mut pass1_remaining: Vec<&SharedFileInfo> = Vec::new();
 
         for file in &files_to_check {
+            let relative = if !share_root.is_empty() && file.path.starts_with(&share_root) {
+                file.path[share_root.len()..].trim_start_matches('/')
+            } else {
+                // share_root 为空（根目录+子目录混选）：
+                // 用 file.path 去掉前导 / 保留完整目录结构，而非退化为 basename
+                file.path.trim_start_matches('/')
+            };
+
+            // 先尝试 temp_base/<relative>（单次转存场景）
+            let expected_path = format!("{}/{}", temp_base, relative);
+            let mut matched = false;
+
+            if let Some((fs_id, path)) = path_to_item.get(expected_path.as_str()) {
+                if !consumed_paths.contains(*path) {
+                    consumed_paths.insert(path.to_string());
+                    recovered_items.push((file.name.clone(), *fs_id, Some(path.to_string()), file.path.clone()));
+                    matched = true;
+                }
+            }
+
+            // 再尝试 group_dir/<relative>（分批转存场景，文件在 temp_dir/group_N/ 下）
+            if !matched {
+                for gdir in &group_dirs {
+                    let group_expected = format!("{}/{}", gdir.trim_end_matches('/'), relative);
+                    if let Some((fs_id, path)) = path_to_item.get(group_expected.as_str()) {
+                        if !consumed_paths.contains(*path) {
+                            consumed_paths.insert(path.to_string());
+                            recovered_items.push((file.name.clone(), *fs_id, Some(path.to_string()), file.path.clone()));
+                            matched = true;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if !matched {
+                pass1_remaining.push(file);
+            }
+        }
+
+        let pass1_matched = recovered_items.len();
+        debug!("Phase1 Pass1 (路径匹配): matched={}, remaining={}", pass1_matched, pass1_remaining.len());
+
+        // ---------- Pass 2: 名称回退（仅对 Pass 1 未命中的文件） ----------
+        let mut consumed_names: std::collections::HashSet<(String, bool)> = std::collections::HashSet::new();
+        let mut unmatched_files: Vec<&SharedFileInfo> = Vec::new();
+
+        for file in &pass1_remaining {
             let key = (file.name.clone(), file.is_dir);
-            if !consumed.contains(&key) {
+            if !consumed_names.contains(&key) {
                 if let Some((fs_id, path)) = name_dir_to_item.get(&key) {
-                    consumed.insert(key);
-                    recovered_items.push((file.name.clone(), *fs_id, Some(path.clone()), file.path.clone()));
-                    continue;
+                    if !consumed_paths.contains(path) {
+                        consumed_names.insert(key);
+                        consumed_paths.insert(path.clone());
+                        recovered_items.push((file.name.clone(), *fs_id, Some(path.clone()), file.path.clone()));
+                        continue;
+                    }
                 }
             }
             unmatched_files.push(file);
@@ -2401,7 +2726,7 @@ impl TransferManager {
 
         // Phase 1 匹配摘要
         info!(
-            "恢复 Phase1 完成: task_id={}, files_to_check={}, existing_root_items={}, \
+            "恢复 Phase1 完成: task_id={}, files_to_check={}, existing_items={}, \
              phase1_matched={}, phase1_unmatched={}",
             recovery_task_id,
             files_to_check.len(),
@@ -2419,32 +2744,6 @@ impl TransferManager {
                 unmatched_files.len()
             );
 
-            // 推导 files_to_check 的公共父目录（即分享浏览目录）
-            // 按路径段（/分隔）逐段比较，避免 /share/A 错匹配 /share/AB
-            let share_root = {
-                let parents: Vec<Vec<&str>> = files_to_check
-                    .iter()
-                    .filter_map(|f| f.path.rsplit_once('/').map(|(p, _)| p))
-                    .map(|p| p.split('/').collect::<Vec<_>>())
-                    .collect();
-                if parents.is_empty() {
-                    String::new()
-                } else {
-                    let mut common_segments = parents[0].clone();
-                    for segs in &parents[1..] {
-                        let match_len = common_segments
-                            .iter()
-                            .zip(segs.iter())
-                            .take_while(|(a, b)| a == b)
-                            .count();
-                        common_segments.truncate(match_len);
-                    }
-                    common_segments.join("/")
-                }
-            };
-            debug!("推导的分享根目录: {:?}", share_root);
-
-            let temp_base = temp_dir.trim_end_matches('/');
             let mut still_failed = Vec::new();
 
             // 按父目录缓存扫描结果，避免同一目录重复请求
@@ -2455,7 +2754,8 @@ impl TransferManager {
                 let relative = if !share_root.is_empty() && file.path.starts_with(&share_root) {
                     file.path[share_root.len()..].trim_start_matches('/')
                 } else {
-                    &file.name
+                    // share_root 为空时保留完整目录结构，与 Phase 1 一致
+                    file.path.trim_start_matches('/')
                 };
 
                 let expected_path = format!("{}/{}", temp_base, relative);
@@ -2468,50 +2768,81 @@ impl TransferManager {
                     file.name, file.path, expected_path, expected_parent
                 );
 
-                // 仅当推导出的父目录与根目录不同时才有意义（根目录已在 Phase 1 扫过）
-                let found = if expected_parent != temp_base {
-                    // 缓存未命中时拉取完整目录列表（分页）
-                    if !dir_cache.contains_key(expected_parent) {
-                        let mut all_items = Vec::new();
-                        let page_size: u32 = 1000;
-                        let mut page: u32 = 1;
-                        loop {
-                            match client.get_file_list(expected_parent, page, page_size).await {
-                                Ok(list) => {
-                                    let batch_len = list.list.len();
-                                    all_items.extend(list.list);
-                                    if (batch_len as u32) < page_size {
+                // 内联辅助：扫描指定目录到缓存（如果尚未缓存）
+                macro_rules! ensure_dir_cached {
+                    ($dir:expr) => {
+                        if !dir_cache.contains_key($dir) {
+                            let mut all_items = Vec::new();
+                            let ps: u32 = 1000;
+                            let mut pg: u32 = 1;
+                            let mut fetch_failed = false;
+                            loop {
+                                match client.get_file_list($dir, pg, ps).await {
+                                    Ok(list) => {
+                                        let n = list.list.len();
+                                        all_items.extend(list.list);
+                                        if (n as u32) < ps { break; }
+                                        pg += 1;
+                                    }
+                                    Err(e) => {
+                                        warn!("🔍 诊断：路径推导扫描 API 失败 (task_id={}, parent={}, page={}, error={})",
+                                            recovery_task_id, $dir, pg, e);
+                                        fetch_failed = true;
                                         break;
                                     }
-                                    page += 1;
-                                }
-                                Err(e) => {
-                                    debug!(
-                                        "路径推导扫描失败: dir={}, page={}, error={}",
-                                        expected_parent, page, e
-                                    );
-                                    break;
                                 }
                             }
+                            if !fetch_failed {
+                                if all_items.is_empty() {
+                                    warn!("🔍 诊断：expected_parent 存在但为空 (task_id={}, parent={}, items=0)",
+                                        recovery_task_id, $dir);
+                                } else {
+                                    let fc = all_items.iter().filter(|f| f.isdir == 0).count();
+                                    let dc = all_items.iter().filter(|f| f.isdir == 1).count();
+                                    let sample: Vec<&str> = all_items.iter().take(5).map(|f| f.server_filename.as_str()).collect();
+                                    info!("🔍 诊断：expected_parent 存在 (task_id={}, parent={}, total={}, files={}, dirs={}, sample={:?})",
+                                        recovery_task_id, $dir, all_items.len(), fc, dc, sample);
+                                }
+                            }
+                            dir_cache.insert($dir.to_string(), all_items);
                         }
-                        dir_cache.insert(expected_parent.to_string(), all_items);
-                    }
+                    };
+                }
 
-                    dir_cache.get(expected_parent).and_then(|items| {
+                // 在缓存中按 name+is_dir 查找（排除已消费路径）
+                let find_in_dir = |dir: &str, cache: &HashMap<String, Vec<crate::netdisk::types::FileItem>>, name: &str, is_dir: bool, consumed: &std::collections::HashSet<String>| -> Option<(Option<u64>, String)> {
+                    cache.get(dir).and_then(|items| {
                         items.iter().find(|f| {
-                            f.server_filename == file.name && (f.isdir == 1) == file.is_dir
+                            f.server_filename == name && (f.isdir == 1) == is_dir && !consumed.contains(&f.path)
                         }).map(|f| {
-                            let fs_id = if file.is_dir { None } else { Some(f.fs_id) };
+                            let fs_id = if is_dir { None } else { Some(f.fs_id) };
                             (fs_id, f.path.clone())
                         })
                     })
-                } else {
-                    None
                 };
 
-                if let Some((fs_id, path)) = found {
+                // 1. 尝试推导出的父目录（仅当不同于根目录时，根目录已在 Phase 1 扫过）
+                let mut found: Option<(Option<u64>, String)> = None;
+                if expected_parent != temp_base {
+                    ensure_dir_cached!(expected_parent);
+                    found = find_in_dir(expected_parent, &dir_cache, &file.name, file.is_dir, &consumed_paths);
+                }
+
+                // 2. 如果推导目录未命中，尝试每个 group_N 子目录（分批转存场景）
+                if found.is_none() && !group_dirs.is_empty() {
+                    for gdir in &group_dirs {
+                        ensure_dir_cached!(gdir.as_str());
+                        if let Some(result) = find_in_dir(gdir, &dir_cache, &file.name, file.is_dir, &consumed_paths) {
+                            found = Some(result);
+                            break;
+                        }
+                    }
+                }
+
+                if let Some((fs_id, ref path)) = found {
+                    consumed_paths.insert(path.clone());
                     info!("路径推导匹配成功: name={}, path={}", file.name, path);
-                    recovered_items.push((file.name.clone(), fs_id, Some(path), file.path.clone()));
+                    recovered_items.push((file.name.clone(), fs_id, Some(path.clone()), file.path.clone()));
                 } else {
                     still_failed.push(format!(
                         "{}({}) [expected: {}]",
@@ -2746,7 +3077,7 @@ impl TransferManager {
             auto_download: metadata.auto_download.unwrap_or(false),
             local_download_path: None,
             status,
-            error: None,
+            error: metadata.error_msg.clone(),
             download_task_ids: metadata.download_task_ids.clone(),
             share_info,
             file_list,
@@ -3433,6 +3764,173 @@ pub fn build_fs_ids(
     }
 }
 
+/// 提取路径中的文件名部分
+fn extract_basename_str(path: &str) -> &str {
+    path.rsplit_once('/').map(|(_, name)| name).unwrap_or(path)
+}
+
+/// 提取路径中的父目录部分
+fn extract_parent_dir_str(path: &str) -> &str {
+    path.rsplit_once('/').map(|(parent, _)| parent).unwrap_or("/")
+}
+
+/// 检测跨目录同名文件
+///
+/// 返回存在跨目录同名的 basename 列表。
+/// 如果返回为空，表示没有跨目录同名文件，可以使用单次转存。
+fn detect_cross_dir_duplicates(files: &[SharedFileInfo]) -> Vec<String> {
+    let mut basename_to_parents: HashMap<String, std::collections::HashSet<String>> = HashMap::new();
+    for file in files {
+        let basename = extract_basename_str(&file.path).to_string();
+        let parent = extract_parent_dir_str(&file.path).to_string();
+        basename_to_parents.entry(basename).or_default().insert(parent);
+    }
+    basename_to_parents
+        .into_iter()
+        .filter(|(_, parents)| parents.len() > 1)
+        .map(|(basename, _)| basename)
+        .collect()
+}
+
+/// 按冲突关系分组文件（贪心策略，最小化批次数）
+///
+/// 同名文件（basename 相同但父目录不同）不能在同一组。
+/// 非冲突文件尽量放入已有组，减少组数。
+fn group_files_by_conflict(files: &[SharedFileInfo]) -> Vec<(String, Vec<SharedFileInfo>)> {
+    // 找出所有冲突的 basename（跨目录同名）
+    let conflict_basenames: std::collections::HashSet<String> = {
+        let mut basename_to_parents: HashMap<String, std::collections::HashSet<String>> = HashMap::new();
+        for file in files {
+            let basename = extract_basename_str(&file.path).to_string();
+            let parent = extract_parent_dir_str(&file.path).to_string();
+            basename_to_parents.entry(basename).or_default().insert(parent);
+        }
+        basename_to_parents
+            .into_iter()
+            .filter(|(_, parents)| parents.len() > 1)
+            .map(|(basename, _)| basename)
+            .collect()
+    };
+
+    // 贪心分组
+    let mut groups: Vec<Vec<SharedFileInfo>> = Vec::new();
+
+    for file in files {
+        let basename = extract_basename_str(&file.path).to_string();
+
+        let mut added = false;
+        if conflict_basenames.contains(&basename) {
+            // 冲突文件：只能加入不包含同名文件的组
+            for group in &mut groups {
+                let has_conflict = group.iter().any(|g| {
+                    extract_basename_str(&g.path) == basename
+                });
+                if !has_conflict {
+                    group.push(file.clone());
+                    added = true;
+                    break;
+                }
+            }
+        } else {
+            // 非冲突文件：加入第一个组
+            if let Some(group) = groups.first_mut() {
+                group.push(file.clone());
+                added = true;
+            }
+        }
+
+        if !added {
+            groups.push(vec![file.clone()]);
+        }
+    }
+
+    groups
+        .into_iter()
+        .enumerate()
+        .map(|(idx, files)| (format!("group_{}", idx + 1), files))
+        .collect()
+}
+
+/// 合并分批转存结果
+///
+/// 关键逻辑：至少一个批次成功就标记 success=true，继续自动下载流程。
+fn merge_batch_results(
+    results: Vec<(usize, String, Vec<SharedFileInfo>, Result<TransferResult>)>,
+    temp_dir: &str,
+) -> (TransferResult, Vec<BatchGroupInfo>) {
+    let mut merged = TransferResult {
+        success: false,
+        transferred_paths: Vec::new(),
+        from_paths: Vec::new(),
+        transferred_fs_ids: Vec::new(),
+        error: None,
+    };
+
+    let mut batch_groups_info = Vec::new();
+    let mut failed_batches = Vec::new();
+    let mut success_count = 0usize;
+
+    for (batch_index, group_id, group_files, result) in results {
+        match result {
+            Ok(r) if r.success => {
+                success_count += 1;
+                merged.transferred_paths.extend(r.transferred_paths.clone());
+                merged.from_paths.extend(r.from_paths);
+                merged.transferred_fs_ids.extend(r.transferred_fs_ids.clone());
+
+                batch_groups_info.push(BatchGroupInfo {
+                    group_id: group_id.clone(),
+                    remote_dir: format!("{}/group_{}", temp_dir, batch_index),
+                    files: group_files,
+                    transferred_paths: r.transferred_paths,
+                    transferred_fs_ids: r.transferred_fs_ids,
+                });
+            }
+            Ok(r) => {
+                failed_batches.push((batch_index, group_id, r.error.unwrap_or_default()));
+            }
+            Err(e) => {
+                failed_batches.push((batch_index, group_id, e.to_string()));
+            }
+        }
+    }
+
+    if success_count > 0 {
+        merged.success = true;
+        if !failed_batches.is_empty() {
+            let failed_info: Vec<String> = failed_batches
+                .iter()
+                .map(|(idx, gid, err)| format!("batch_{} ({}): {}", idx, gid, err))
+                .collect();
+            merged.error = Some(format!(
+                "部分批次失败 ({}/{}): {}",
+                failed_batches.len(),
+                success_count + failed_batches.len(),
+                failed_info.join("; ")
+            ));
+        }
+    } else {
+        let all_errors: Vec<String> = failed_batches
+            .iter()
+            .map(|(idx, gid, err)| format!("batch_{} ({}): {}", idx, gid, err))
+            .collect();
+        merged.error = Some(format!(
+            "所有批次转存失败: {}",
+            all_errors.join("; ")
+        ));
+    }
+
+    info!(
+        "分批转存结果汇总: total_batches={}, success={}, failed={}, total_files={}",
+        success_count + failed_batches.len(),
+        success_count,
+        failed_batches.len(),
+        merged.transferred_paths.len()
+    );
+
+    (merged, batch_groups_info)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3494,5 +3992,237 @@ mod tests {
     fn test_extract_task_errno_embedded_in_long_message() {
         let msg = "异步转存任务失败: task_errno=-30, response={\"errno\":0,\"task_id\":123456,\"task_errno\":-30,\"status\":\"failed\"}";
         assert_eq!(TransferManager::extract_task_errno(msg), Some(-30));
+    }
+
+    fn make_file(path: &str, fs_id: u64) -> SharedFileInfo {
+        let name = path.rsplit('/').next().unwrap_or(path).to_string();
+        SharedFileInfo {
+            fs_id,
+            is_dir: false,
+            path: path.to_string(),
+            size: 100,
+            name,
+        }
+    }
+
+    // ========== extract helpers ==========
+
+    #[test]
+    fn test_extract_basename_str_nested() {
+        assert_eq!(extract_basename_str("/a/b/c.jpg"), "c.jpg");
+    }
+
+    #[test]
+    fn test_extract_basename_str_root_file() {
+        assert_eq!(extract_basename_str("c.jpg"), "c.jpg");
+    }
+
+    #[test]
+    fn test_extract_parent_dir_str_nested() {
+        assert_eq!(extract_parent_dir_str("/a/b/c.jpg"), "/a/b");
+    }
+
+    #[test]
+    fn test_extract_parent_dir_str_root_file() {
+        assert_eq!(extract_parent_dir_str("c.jpg"), "/");
+    }
+
+    // ========== detect_cross_dir_duplicates ==========
+
+    #[test]
+    fn test_detect_no_duplicates() {
+        let files = vec![
+            make_file("/a/1.jpg", 1),
+            make_file("/a/2.jpg", 2),
+        ];
+        let dups = detect_cross_dir_duplicates(&files);
+        assert!(dups.is_empty(), "同目录不同名，不应检测到跨目录同名");
+    }
+
+    #[test]
+    fn test_detect_same_dir_same_name() {
+        let files = vec![
+            make_file("/a/1.jpg", 1),
+            make_file("/a/1.jpg", 2),
+        ];
+        let dups = detect_cross_dir_duplicates(&files);
+        assert!(dups.is_empty(), "同目录同名，不应检测到跨目录同名");
+    }
+
+    #[test]
+    fn test_detect_cross_dir_duplicates_basic() {
+        let files = vec![
+            make_file("/抖音/1.jpg", 1),
+            make_file("/微信/1.jpg", 2),
+        ];
+        let dups = detect_cross_dir_duplicates(&files);
+        assert!(dups.contains(&"1.jpg".to_string()));
+    }
+
+    #[test]
+    fn test_detect_cross_dir_multiple() {
+        let files = vec![
+            make_file("/A/x.jpg", 1),
+            make_file("/B/x.jpg", 2),
+            make_file("/C/y.jpg", 3),
+            make_file("/D/y.jpg", 4),
+            make_file("/E/z.jpg", 5),
+        ];
+        let mut dups = detect_cross_dir_duplicates(&files);
+        dups.sort();
+        assert_eq!(dups, vec!["x.jpg".to_string(), "y.jpg".to_string()]);
+    }
+
+    #[test]
+    fn test_detect_empty() {
+        assert!(detect_cross_dir_duplicates(&[]).is_empty());
+    }
+
+    // ========== group_files_by_conflict ==========
+
+    #[test]
+    fn test_group_no_conflict_single_group() {
+        let files = vec![
+            make_file("/a/1.jpg", 1),
+            make_file("/b/2.jpg", 2),
+            make_file("/c/3.jpg", 3),
+        ];
+        let groups = group_files_by_conflict(&files);
+        assert_eq!(groups.len(), 1, "无冲突时应只有 1 个组");
+        assert_eq!(groups[0].1.len(), 3);
+    }
+
+    #[test]
+    fn test_group_two_conflict_two_groups() {
+        let files = vec![
+            make_file("/A/1.jpg", 1),
+            make_file("/B/1.jpg", 2),
+        ];
+        let groups = group_files_by_conflict(&files);
+        assert_eq!(groups.len(), 2, "2 个跨目录同名文件需要 2 个组");
+        for (_, g) in &groups {
+            assert_eq!(g.len(), 1);
+        }
+    }
+
+    #[test]
+    fn test_group_non_conflict_files_join_first_group() {
+        let files = vec![
+            make_file("/A/1.jpg", 1),
+            make_file("/B/1.jpg", 2),
+            make_file("/C/2.jpg", 3),
+            make_file("/D/3.jpg", 4),
+        ];
+        let groups = group_files_by_conflict(&files);
+        // 1.jpg 需要 2 个组；2.jpg 和 3.jpg 无冲突可加入第一个组
+        assert_eq!(groups.len(), 2, "只有 1.jpg 冲突，共 2 个组");
+        let total: usize = groups.iter().map(|(_, g)| g.len()).sum();
+        assert_eq!(total, 4, "所有文件都应被分配");
+    }
+
+    #[test]
+    fn test_group_three_way_conflict() {
+        let files = vec![
+            make_file("/A/x.jpg", 1),
+            make_file("/B/x.jpg", 2),
+            make_file("/C/x.jpg", 3),
+        ];
+        let groups = group_files_by_conflict(&files);
+        assert_eq!(groups.len(), 3, "3 个跨目录同名文件需要 3 个组");
+    }
+
+    #[test]
+    fn test_group_ids_are_group_1_2_etc() {
+        let files = vec![
+            make_file("/A/1.jpg", 1),
+            make_file("/B/1.jpg", 2),
+        ];
+        let groups = group_files_by_conflict(&files);
+        assert_eq!(groups[0].0, "group_1");
+        assert_eq!(groups[1].0, "group_2");
+    }
+
+    #[test]
+    fn test_group_empty_input() {
+        let groups = group_files_by_conflict(&[]);
+        assert!(groups.is_empty());
+    }
+
+    // ========== merge_batch_results ==========
+
+    #[test]
+    fn test_merge_all_success() {
+        let r1 = TransferResult {
+            success: true,
+            transferred_paths: vec!["/tmp/group_1/a.jpg".to_string()],
+            from_paths: vec!["/share/a.jpg".to_string()],
+            transferred_fs_ids: vec![100],
+            error: None,
+        };
+        let r2 = TransferResult {
+            success: true,
+            transferred_paths: vec!["/tmp/group_2/b.jpg".to_string()],
+            from_paths: vec!["/share/b.jpg".to_string()],
+            transferred_fs_ids: vec![200],
+            error: None,
+        };
+        let results = vec![
+            (1usize, "group_1".to_string(), vec![make_file("/share/a.jpg", 1)], Ok(r1)),
+            (2usize, "group_2".to_string(), vec![make_file("/share/b.jpg", 2)], Ok(r2)),
+        ];
+        let (merged, groups_info) = merge_batch_results(results, "/tmp/group");
+        assert!(merged.success);
+        assert!(merged.error.is_none());
+        assert_eq!(merged.transferred_paths.len(), 2);
+        assert_eq!(groups_info.len(), 2);
+    }
+
+    #[test]
+    fn test_merge_partial_failure_still_success() {
+        let r1 = TransferResult {
+            success: true,
+            transferred_paths: vec!["/tmp/group_1/a.jpg".to_string()],
+            from_paths: vec!["/share/a.jpg".to_string()],
+            transferred_fs_ids: vec![100],
+            error: None,
+        };
+        let results = vec![
+            (1usize, "group_1".to_string(), vec![make_file("/share/a.jpg", 1)], Ok(r1)),
+            (2usize, "group_2".to_string(), vec![make_file("/share/b.jpg", 2)], Err(anyhow::anyhow!("api error"))),
+        ];
+        let (merged, groups_info) = merge_batch_results(results, "/tmp/group");
+        assert!(merged.success, "至少一个批次成功应返回 success=true");
+        assert!(merged.error.is_some(), "部分失败时应记录 error 警告");
+        assert_eq!(merged.transferred_paths.len(), 1);
+        assert_eq!(groups_info.len(), 1);
+    }
+
+    #[test]
+    fn test_merge_all_fail() {
+        let results: Vec<(usize, String, Vec<SharedFileInfo>, Result<TransferResult>)> = vec![
+            (1usize, "group_1".to_string(), vec![], Err(anyhow::anyhow!("fail 1"))),
+            (2usize, "group_2".to_string(), vec![], Err(anyhow::anyhow!("fail 2"))),
+        ];
+        let (merged, groups_info) = merge_batch_results(results, "/tmp/group");
+        assert!(!merged.success, "所有批次失败应返回 success=false");
+        assert!(merged.error.is_some());
+        assert!(groups_info.is_empty());
+    }
+
+    #[test]
+    fn test_merge_single_success() {
+        let r1 = TransferResult {
+            success: true,
+            transferred_paths: vec!["/tmp/a.jpg".to_string()],
+            from_paths: vec![],
+            transferred_fs_ids: vec![1],
+            error: None,
+        };
+        let results = vec![
+            (1usize, "group_1".to_string(), vec![], Ok(r1)),
+        ];
+        let (merged, _) = merge_batch_results(results, "/tmp");
+        assert!(merged.success);
+        assert!(merged.error.is_none());
     }
 }

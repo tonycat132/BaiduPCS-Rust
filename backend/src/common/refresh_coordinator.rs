@@ -63,7 +63,7 @@ impl RefreshCoordinator {
     /// # 返回
     /// - `Some(RefreshGuard)`: 成功获取，可以执行刷新
     /// - `None`: 正在刷新或间隔太短
-    pub fn try_acquire(&self) -> Option<RefreshGuard> {
+    pub fn try_acquire(&self) -> Option<RefreshGuard<'_>> {
         // 1. 原子性地尝试将 is_refreshing 从 false 改为 true
         //    使用 compare_exchange 而非 swap，确保只有一个线程能成功
         if self
@@ -108,7 +108,7 @@ impl RefreshCoordinator {
     /// 强制获取刷新锁（忽略时间间隔限制）
     ///
     /// 用于定时刷新场景，定时器本身已保证间隔
-    pub fn force_acquire(&self) -> Option<RefreshGuard> {
+    pub fn force_acquire(&self) -> Option<RefreshGuard<'_>> {
         if self
             .is_refreshing
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
