@@ -81,9 +81,15 @@ impl Default for ScanConfig {
     }
 }
 
-fn default_scan_batch_size() -> usize { 1000 }
-fn default_max_pending_tasks() -> usize { 5000 }
-fn default_progress_interval() -> usize { 500 }
+fn default_scan_batch_size() -> usize {
+    1000
+}
+fn default_max_pending_tasks() -> usize {
+    5000
+}
+fn default_progress_interval() -> usize {
+    500
+}
 
 /// 冲突策略配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -101,7 +107,8 @@ impl Default for ConflictStrategyConfig {
     fn default() -> Self {
         Self {
             default_upload_strategy: crate::uploader::conflict::UploadConflictStrategy::SmartDedup,
-            default_download_strategy: crate::uploader::conflict::DownloadConflictStrategy::Overwrite,
+            default_download_strategy:
+            crate::uploader::conflict::DownloadConflictStrategy::Overwrite,
         }
     }
 }
@@ -671,21 +678,111 @@ pub struct FilesystemConfig {
     /// 允许访问的路径白名单（空表示允许所有）
     #[serde(default)]
     pub allowed_paths: Vec<String>,
+    /// 上传弹窗默认优先展示的白名单目录
+    #[serde(default)]
+    pub default_path: Option<String>,
     /// 是否显示隐藏文件
     #[serde(default)]
     pub show_hidden: bool,
     /// 是否跟随符号链接
     #[serde(default)]
     pub follow_symlinks: bool,
+    /// 当 follow_symlinks=true 时，递归扫描过程中是否强制校验
+    /// 符号链接目标仍在 allowed_paths 白名单内。
+    /// 默认 false（不校验）；设为 true 可防止通过白名单内的符号链接
+    /// 将白名单外的内容带入上传。
+    #[serde(default)]
+    pub enforce_allowlist_on_followed_symlinks: bool,
 }
 
 impl Default for FilesystemConfig {
     fn default() -> Self {
         Self {
             allowed_paths: vec![],
+            default_path: None,
             show_hidden: false,
             follow_symlinks: false,
+            enforce_allowlist_on_followed_symlinks: false,
         }
+    }
+}
+
+impl FilesystemConfig {
+    /// 校验文件系统配置的结构合法性
+    ///
+    /// **硬错误**（阻止加载/保存）：
+    /// - allowed_paths / default_path 不是绝对路径
+    /// - 路径存在但不是目录
+    /// - default_path 不在 allowed_paths 白名单内
+    ///
+    /// **软警告**（记录日志，运行时跳过）：
+    /// - allowed_paths 中的路径不存在 → 运行时 `resolve_allowed_roots()` 跳过该条目
+    /// - default_path 不存在 → 运行时 `resolve_default_directory()` 视为未配置
+    pub fn validate(&self) -> Result<()> {
+        // 校验 allowed_paths
+        for (i, path_str) in self.allowed_paths.iter().enumerate() {
+            let path = std::path::PathBuf::from(path_str);
+            if !path.is_absolute() {
+                anyhow::bail!(
+                    "filesystem.allowed_paths[{}] 必须是绝对路径，当前值: {:?}",
+                    i, path_str
+                );
+            }
+            if !path.exists() {
+                tracing::warn!(
+                    "filesystem.allowed_paths[{}] 路径不存在（运行时将跳过该条目）: {:?}",
+                    i, path_str
+                );
+            } else if !path.is_dir() {
+                anyhow::bail!(
+                    "filesystem.allowed_paths[{}] 不是目录: {:?}",
+                    i, path_str
+                );
+            }
+        }
+
+        // 校验 default_path
+        if let Some(ref default_path) = self.default_path {
+            let path = std::path::PathBuf::from(default_path);
+            if !path.is_absolute() {
+                anyhow::bail!(
+                    "filesystem.default_path 必须是绝对路径，当前值: {:?}",
+                    default_path
+                );
+            }
+            if !path.exists() {
+                tracing::warn!(
+                    "filesystem.default_path 路径不存在（运行时将视为未配置）: {:?}",
+                    default_path
+                );
+                // 路径不存在时无法做 allowlist 校验，跳过
+                return Ok(());
+            }
+            if !path.is_dir() {
+                anyhow::bail!(
+                    "filesystem.default_path 不是目录: {:?}",
+                    default_path
+                );
+            }
+            // default_path 必须位于 allowed_paths 内（如果白名单非空）
+            if !self.allowed_paths.is_empty() {
+                let default_canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
+                let in_allowlist = self.allowed_paths.iter().any(|allowed| {
+                    std::path::PathBuf::from(allowed)
+                        .canonicalize()
+                        .map(|c| default_canonical.starts_with(&c))
+                        .unwrap_or(false)
+                });
+                if !in_allowlist {
+                    anyhow::bail!(
+                        "filesystem.default_path ({:?}) 不在 allowed_paths 白名单内",
+                        default_path
+                    );
+                }
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -1099,6 +1196,12 @@ impl AppConfig {
             .validate_temp_dir()
             .context("配置文件中的分享直下临时目录验证失败")?;
 
+        // 验证文件系统配置
+        config
+            .filesystem
+            .validate()
+            .context("配置文件中的文件系统配置验证失败")?;
+
         Ok(config)
     }
 
@@ -1123,6 +1226,11 @@ impl AppConfig {
         self.share_direct_download
             .validate_temp_dir()
             .context("保存配置失败：分享直下临时目录路径不安全")?;
+
+        // 1c. 验证文件系统配置
+        self.filesystem
+            .validate()
+            .context("保存配置失败：文件系统配置验证失败")?;
 
         // 2. 增强验证（存在性、可写性、可用空间）
         let validation_result = self
@@ -1546,8 +1654,8 @@ mod tests {
 
     // ========== 冲突策略配置测试 ==========
 
+    use crate::uploader::conflict::{DownloadConflictStrategy, UploadConflictStrategy};
     use proptest::prelude::*;
-    use crate::uploader::conflict::{UploadConflictStrategy, DownloadConflictStrategy};
 
     // 生成器：上传冲突策略
     fn prop_upload_strategy() -> impl Strategy<Value = UploadConflictStrategy> {
@@ -1686,5 +1794,63 @@ ask_each_time = true
         assert!(toml_str.contains("smart_dedup"));
         assert!(toml_str.contains("overwrite"));
     }
-}
 
+    // ========== 文件系统配置校验测试 ==========
+
+    #[test]
+    fn test_filesystem_config_validate_empty_is_ok() {
+        let config = FilesystemConfig::default();
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_filesystem_config_validate_relative_allowed_path_fails() {
+        let config = FilesystemConfig {
+            allowed_paths: vec!["relative/path".to_string()],
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_filesystem_config_validate_relative_default_path_fails() {
+        let config = FilesystemConfig {
+            default_path: Some("relative/path".to_string()),
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_filesystem_config_validate_default_path_outside_allowlist_fails() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let allowed = temp_dir.path().join("allowed");
+        let other = temp_dir.path().join("other");
+        std::fs::create_dir_all(&allowed).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+
+        let config = FilesystemConfig {
+            allowed_paths: vec![allowed.to_string_lossy().to_string()],
+            default_path: Some(other.to_string_lossy().to_string()),
+            ..Default::default()
+        };
+        assert!(
+            config.validate().is_err(),
+            "default_path outside allowlist should fail validation"
+        );
+    }
+
+    #[test]
+    fn test_filesystem_config_validate_valid_config_ok() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let allowed = temp_dir.path().join("allowed");
+        std::fs::create_dir_all(&allowed).unwrap();
+
+        let config = FilesystemConfig {
+            allowed_paths: vec![allowed.to_string_lossy().to_string()],
+            default_path: Some(allowed.to_string_lossy().to_string()),
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok());
+    }
+}

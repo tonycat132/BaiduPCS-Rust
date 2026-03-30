@@ -9,8 +9,8 @@ use axum::{
 use serde::Serialize;
 
 use crate::filesystem::{
-    FileEntry, FilesystemConfig, FilesystemService, FsError, FsErrorCode, GotoRequest,
-    GotoResponse, ListRequest, ListResponse, ValidateRequest, ValidateResponse,
+    FilesystemConfig, FilesystemService, FsError, FsErrorCode, GotoRequest,
+    GotoResponse, ListRequest, ListResponse, RootsResponse, ValidateRequest, ValidateResponse,
 };
 use crate::server::state::AppState;
 
@@ -52,18 +52,17 @@ impl IntoResponse for FsError {
 }
 
 /// 创建文件系统服务
-fn create_fs_service() -> FilesystemService {
-    // TODO: 从配置读取 FilesystemConfig
-    FilesystemService::new(FilesystemConfig::default())
+fn create_fs_service(config: FilesystemConfig) -> FilesystemService {
+    FilesystemService::new(config)
 }
 
 /// GET /api/v1/fs/list?path=/&page=0&page_size=100&sort_field=name&sort_order=asc
 /// 列出目录内容（支持分页）
 pub async fn list_directory(
-    State(_app_state): State<AppState>,
+    State(app_state): State<AppState>,
     Query(req): Query<ListRequest>,
 ) -> Result<Json<ApiResponse<ListResponse>>, FsError> {
-    let service = create_fs_service();
+    let service = create_fs_service(app_state.config.read().await.filesystem.clone());
     let response = service.list_directory(&req)?;
     Ok(Json(ApiResponse::success(response)))
 }
@@ -71,10 +70,10 @@ pub async fn list_directory(
 /// GET /api/v1/fs/goto?path=/home/user/documents
 /// 路径跳转（直达路径）
 pub async fn goto_path(
-    State(_app_state): State<AppState>,
+    State(app_state): State<AppState>,
     Query(req): Query<GotoRequest>,
 ) -> Json<ApiResponse<GotoResponse>> {
-    let service = create_fs_service();
+    let service = create_fs_service(app_state.config.read().await.filesystem.clone());
     let response = service.goto_path(&req);
     Json(ApiResponse::success(response))
 }
@@ -82,20 +81,20 @@ pub async fn goto_path(
 /// GET /api/v1/fs/validate?path=/xxx&type=file
 /// 校验路径有效性
 pub async fn validate_path(
-    State(_app_state): State<AppState>,
+    State(app_state): State<AppState>,
     Query(req): Query<ValidateRequest>,
 ) -> Json<ApiResponse<ValidateResponse>> {
-    let service = create_fs_service();
+    let service = create_fs_service(app_state.config.read().await.filesystem.clone());
     let response = service.validate_path(&req);
     Json(ApiResponse::success(response))
 }
 
 /// GET /api/v1/fs/roots
-/// 获取根目录列表
+/// 获取根目录列表（含默认目录路径）
 pub async fn get_roots(
-    State(_app_state): State<AppState>,
-) -> Result<Json<ApiResponse<Vec<FileEntry>>>, FsError> {
-    let service = create_fs_service();
-    let roots = service.get_roots()?;
-    Ok(Json(ApiResponse::success(roots)))
+    State(app_state): State<AppState>,
+) -> Result<Json<ApiResponse<RootsResponse>>, FsError> {
+    let service = create_fs_service(app_state.config.read().await.filesystem.clone());
+    let response = service.get_roots_with_default()?;
+    Ok(Json(ApiResponse::success(response)))
 }
